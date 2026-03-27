@@ -70,6 +70,44 @@ using CompactionCbFunc =
     std::function< CompactionCbDecision(const CompactionCbParams&) >;
 
 
+/**
+ * Result returned by FlushDecisionCbFunc.
+ */
+struct FlushDecisionCbResult {
+    FlushDecisionCbResult()
+        : allowFlush(true)
+        , rollbackSafeSeqnum(0)
+    {}
+
+    FlushDecisionCbResult(bool allow, uint64_t safe_seq)
+        : allowFlush(allow)
+        , rollbackSafeSeqnum(safe_seq)
+    {}
+
+    /**
+     * If `false`, flush (log to table) is blocked entirely.
+     */
+    bool allowFlush;
+
+    /**
+     * Sequence number up to which it is safe to flush into LSM tables.
+     * Data beyond this sequence number will stay in the log section
+     * and remain rollback-able.
+     * If `0`, nothing will be flushed (most conservative).
+     */
+    uint64_t rollbackSafeSeqnum;
+};
+
+/**
+ * Callback function invoked before flushing log data to LSM tables.
+ * Allows the caller to control how far the flush can proceed,
+ * keeping data beyond the safe point in the log section for
+ * potential rollback.
+ */
+using FlushDecisionCbFunc =
+    std::function< FlushDecisionCbResult() >;
+
+
 enum SearchCbDecision : int {
     /**
      * Continue searching.
@@ -128,6 +166,7 @@ public:
         , cmpFunc(nullptr)
         , cmpFuncParam(nullptr)
         , compactionCbFunc(nullptr)
+        , flushDecisionCbFunc(nullptr)
         , allowLogging(true)
         , throttlingThreshold(10000)
         , throttlingNumLogFilesSoft(16)
@@ -266,6 +305,14 @@ public:
      * Compaction callback function.
      */
     CompactionCbFunc compactionCbFunc;
+
+    /**
+     * Flush decision callback function.
+     * If set, invoked before flushing log data to LSM tables.
+     * Returns whether flush is allowed and the maximum safe sequence
+     * number up to which data can be flushed.
+     */
+    FlushDecisionCbFunc flushDecisionCbFunc;
 
     /**
      * Allow logging system info.
