@@ -215,6 +215,7 @@ struct DebugParams {
         , afterMemTableFlushCb(nullptr)
         , adjustL0Cb(nullptr)
         , inPlaceCompactionBeforeLockCb(nullptr)
+        , logRecoveryTruncateCb(nullptr)
         , forceMerge(false)
         {}
 
@@ -339,6 +340,16 @@ struct DebugParams {
      * after picking a victim table and before locking it.
      */
     std::function< void(const GenericCbParams&) > inPlaceCompactionBeforeLockCb;
+
+    /**
+     * [TEST ONLY] For emulating a crash in the middle of log recovery.
+     *
+     * Callback function that will be invoked during log recovery,
+     * after the aligned log manifest is persisted, but before
+     * truncating log files that ended with an unreadable entry.
+     * The next recovery should still succeed with the persisted manifest.
+     */
+    std::function< void(const GenericCbParams&) > logRecoveryTruncateCb;
 
     /**
      * If true, merge will proceed the task even with the small number

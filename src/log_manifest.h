@@ -359,19 +359,42 @@ private:
         uint64_t syncedSeq;
     };
 
+    struct Truncation {
+        uint64_t fileNum;
+        uint64_t size;
+    };
+
+    /**
+     * Append footer, version, and CRC to `ss` (serialized into
+     * `mani_buf`), and write it to the manifest file.
+     */
+    Status writeManifest(SizedBuf& mani_buf,
+                         RwSerializer& ss,
+                         bool call_fsync);
+
+    /**
+     * Store the given entries with fsync, instead of the loaded log files.
+     */
+    Status storeEntries(const std::vector<Entry>& entries);
+
     /**
      * (Log-section mode only)
      * Align manifest entries with the log files, walking backwards
      * from the newest file. A crash between a log fsync and the
      * following manifest update leaves the manifest behind the files.
      *
+     * Log files are not truncated here: the caller should persist the
+     * updated entries first, and then apply `truncations_out`.
+     *
      * @param[inout] entries Manifest entries, updated after correction.
      * @param[out] changed_out `true` if any entry has been updated.
+     * @param[out] truncations_out Log files to be truncated.
      * @return `FILE_CORRUPTION` if the log files cannot be aligned
      *         without losing synced data.
      */
     Status reconcileWithLogFiles(std::vector<Entry>& entries,
-                                 bool& changed_out);
+                                 bool& changed_out,
+                                 std::vector<Truncation>& truncations_out);
 
     FileOps* fOps;
     FileOps* fLogOps;

@@ -320,18 +320,21 @@ Status LogFile::scan(const std::string& _filename,
     return Status();
 }
 
-Status LogFile::truncateAndSync(uint64_t new_size) {
+Status LogFile::truncateAndSync(FileOps* f_ops,
+                                const std::string& filename,
+                                uint64_t new_size)
+{
     Status s;
-    if (!fHandle) {
-        EP( openFHandle() );
-    }
+    FileHandle* f_handle = nullptr;
+    EP( f_ops->open(&f_handle, filename.c_str()) );
     if (valid_number(new_size)) {
-        s = fOps->ftruncate(fHandle, new_size);
+        s = f_ops->ftruncate(f_handle, new_size);
     }
     if (s) {
-        s = fOps->fsync(fHandle);
+        s = f_ops->fsync(f_handle);
     }
-    closeFHandle();
+    f_ops->close(f_handle);
+    delete f_handle;
     return s;
 }
 

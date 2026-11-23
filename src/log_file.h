@@ -93,10 +93,12 @@ public:
                 ScanResult& result_out);
 
     /**
-     * Truncate the scanned file to `new_size` (if not `NOT_INITIALIZED`),
+     * Truncate the given file to `new_size` (if not `NOT_INITIALIZED`),
      * and fsync it.
      */
-    Status truncateAndSync(uint64_t new_size);
+    static Status truncateAndSync(FileOps* f_ops,
+                                  const std::string& filename,
+                                  uint64_t new_size);
 
     Status truncate(uint64_t seq_upto);
 

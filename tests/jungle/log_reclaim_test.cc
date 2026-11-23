@@ -1935,6 +1935,107 @@ int manifest_crash_incomplete_tail_test(bool stale_manifest) {
     return 0;
 }
 
+int read_file(const std::string& path, std::vector<char>& data_out) {
+    std::ifstream input(path, std::ios::binary);
+    CHK_TRUE(input.good());
+    data_out.assign(std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>());
+    return 0;
+}
+
+int write_file(const std::string& path, const char* data, size_t size) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    CHK_TRUE(output.good());
+    output.write(data, size);
+    output.close();
+    CHK_TRUE(output.good());
+    return 0;
+}
+
+// Crash during recovery, between persisting the aligned manifest and
+// truncating the last log file that ends with a partial record.
+// Steps:
+//   1. sync(true) through 456. Manifest has log1 451/456.
+//   2. Power loss drops the end of log1, leaving 451..453 and a partial 454.
+//   3. Recovery aligns log1 to 451/453 and stores the manifest.
+//   4. Crash before log1 is truncated.
+// Truncating before step 3 would leave log1 ending cleanly at 453 with the
+// manifest still promising 456, so the next open would fail.
+int manifest_crash_during_recovery_truncation_test() {
+    std::string filename;
+    TEST_SUITE_PREPARE_PATH(filename);
+    CHK_Z(init_manifest_crash_test());
+    jungle::DBConfig config = manifest_crash_config();
+    // Direct-I/O padding would hide the partial record.
+    config.directIoOpt.enabled = false;
+
+    const std::string log1 = log_file_path(filename, 1);
+    const std::string manifest = filename + "/log0000_manifest";
+    jungle::DB* db = nullptr;
+    CHK_Z(jungle::DB::open(&db, filename, config));
+    CHK_Z(write_log_seq_range(db, 445, 450));
+    CHK_Z(db->sync(true));
+    CHK_Z(write_log_seq_range(db, 451, 453));
+    CHK_Z(db->sync(true));
+    std::vector<char> log1_upto_453;
+    CHK_Z(read_file(log1, log1_upto_453));
+    CHK_Z(write_log_seq_range(db, 454, 456));
+    CHK_Z(db->sync(true));
+    CHK_Z(jungle::DB::close(db));
+    CHK_Z(check_manifest_entries(manifest, {{445, 450}, {451, 456}}));
+
+    std::vector<char> log1_data;
+    CHK_Z(read_file(log1, log1_data));
+    const size_t torn_size = log1_upto_453.size() + 5;
+    CHK_GT(log1_data.size(), torn_size);
+    CHK_Z(write_file(log1, log1_data.data(), torn_size));
+
+    // Capture the files at the crash point.
+    const std::string snapshot = filename + "/crash_";
+    int num_cb_calls = 0;
+    int cb_status = 0;
+    jungle::DebugParams dp;
+    dp.logRecoveryTruncateCb =
+        [&](const jungle::DebugParams::GenericCbParams&) {
+            num_cb_calls++;
+            for (const std::string& name : {log1, manifest,
+                                            manifest + ".bak"}) {
+                std::string dst = snapshot + name.substr(filename.size() + 1);
+                cb_status |= TestSuite::copyfile(name, dst);
+            }
+        };
+    jungle::DB::setDebugParams(dp);
+    jungle::DB::enableDebugCallbacks(true);
+    jungle::Status s = jungle::DB::open(&db, filename, config);
+    jungle::DB::enableDebugCallbacks(false);
+    CHK_Z(s);
+    CHK_EQ(1, num_cb_calls);
+    CHK_Z(cb_status);
+    CHK_Z(check_seq_ranges(db, {{445, 453}}));
+    CHK_Z(jungle::DB::close(db));
+
+    // The aligned manifest was persisted before truncation.
+    std::vector<char> snapshot_log1;
+    CHK_Z(read_file(snapshot + "log0000_00000001", snapshot_log1));
+    CHK_EQ(torn_size, snapshot_log1.size());
+    for (const char* suffix : {"", ".bak"}) {
+        CHK_Z(check_manifest_entries(snapshot + "log0000_manifest" + suffix,
+                                     {{445, 450}, {451, 453}}));
+    }
+
+    // Recover again from the crash point.
+    CHK_Z(TestSuite::copyfile(snapshot + "log0000_00000001", log1));
+    CHK_Z(TestSuite::copyfile(snapshot + "log0000_manifest", manifest));
+    CHK_Z(TestSuite::copyfile(snapshot + "log0000_manifest.bak",
+                              manifest + ".bak"));
+    CHK_Z(verify_manifest_crash_recovery(filename, config, 2,
+                                         {{445, 453}}, 453,
+                                         {{445, 450}, {451, 453}}));
+    CHK_Z(jungle::shutdown());
+    TEST_SUITE_CLEANUP_PATH();
+    return 0;
+}
+
 
 int void_log_file_at_the_end_test(bool emulate_crash) {
     std::string filename;
@@ -2934,6 +3035,9 @@ int main(int argc, char** argv) {
     ts.doTest("manifest crash with incomplete log test",
               manifest_crash_incomplete_tail_test,
               TestRange<bool>( {false, true} ));
+
+    ts.doTest("manifest crash during recovery truncation test",
+              manifest_crash_during_recovery_truncation_test);
 
     // TODO: expected behavior to be decided together with rollback crash handling.
 #if 0

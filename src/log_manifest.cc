@@ -253,19 +253,26 @@ Status LogManifest::create(const std::string& path,
 //       torn ? warn and accept : FILE_CORRUPTION
 //   if no records:
 //       at the end of the log (not first entry): remove e
-//       else if torn: truncate to last intact entry, fsync
+//       else if torn: truncate to last intact entry later
 //       continue
 //   if r.last >= next_min: FILE_CORRUPTION      // overlap; gaps are fine
 //   if torn or e != (r.min, r.last):
-//       truncate if torn, fsync; e = (r.min, r.last)
+//       fsync; truncate to last intact entry later if torn
+//       e = (r.min, r.last)
 //   next_min = e.min
 //
 // Removing empty tail files lowers max/synced/flushed log numbers to
 // the new last file.
+//
+// Truncation is deferred until the caller persists the updated entries.
+// Otherwise, a crash in between would leave a cleanly-ended file that
+// the old manifest still promises more of, failing the next open.
 Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
-                                          bool& changed_out)
+                                          bool& changed_out,
+                                          std::vector<Truncation>& truncations_out)
 {
     changed_out = false;
+    truncations_out.clear();
     const uint64_t last_synced_log = lastSyncedLog.load();
 
     // Min seq of the closest later file that has records.
@@ -381,7 +388,7 @@ Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
                 // same seq, so it should be removed.
                 num_empty_tail++;
             } else if (torn) {
-                EP( scan_file.truncateAndSync(res.validSize) );
+                truncations_out.push_back({ee.fileNum, res.validSize});
             }
             continue;
         }
@@ -400,8 +407,11 @@ Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
                              res.lastSeq != ee.syncedSeq;
         if (updated || torn) {
             // Records about to be listed in the manifest should be durable.
-            EP( scan_file.truncateAndSync(torn ? res.validSize
-                                               : NOT_INITIALIZED) );
+            EP( LogFile::truncateAndSync(fLogOps, l_filename,
+                                         NOT_INITIALIZED) );
+        }
+        if (torn) {
+            truncations_out.push_back({ee.fileNum, res.validSize});
         }
         if (updated) {
             _log_warn(myLog, "log file %s: updating min seq %s -> %s, "
@@ -509,10 +519,35 @@ Status LogManifest::load(const std::string& path,
     bool entries_changed = false;
     if ( db_config->logSectionOnly &&
          db_config->truncateInconsecutiveLogs ) {
-        s = reconcileWithLogFiles(entries, entries_changed);
+        std::vector<Truncation> truncations;
+        s = reconcileWithLogFiles(entries, entries_changed, truncations);
         if (!s) {
             logFileCorrupted = true;
             throw s;
+        }
+
+        // Persist the aligned entries before truncating log files,
+        // so that the manifest never promises more than the files.
+        if (entries_changed) {
+            TC( storeEntries(entries) );
+        }
+
+        if (!truncations.empty()) {
+            DBMgr* dbm = DBMgr::getWithoutInit();
+            if (dbm && dbm->isDebugCallbackEffective()) {
+                DebugParams dp = dbm->getDebugParams();
+                if (dp.logRecoveryTruncateCb) {
+                    DebugParams::GenericCbParams p;
+                    dp.logRecoveryTruncateCb(p);
+                }
+            }
+        }
+        for (const Truncation& trunc: truncations) {
+            std::string l_filename =
+                LogFile::getLogFileName(dirPath, prefixNum, trunc.fileNum);
+            _log_warn(myLog, "truncating log file %s to %zu",
+                      l_filename.c_str(), trunc.size);
+            TC( LogFile::truncateAndSync(fLogOps, l_filename, trunc.size) );
         }
     }
 
@@ -635,7 +670,7 @@ Status LogManifest::load(const std::string& path,
     }
 
     if (entries_changed) {
-        // Persist the aligned entries.
+        // Persist the adjustments made while loading log files.
         TC( store(true) );
     }
 
@@ -686,8 +721,6 @@ Status LogManifest::store(bool call_fsync) {
 }
 
 Status LogManifest::storeInternal(bool call_fsync) {
-    Status s;
-
     SizedBuf mani_buf(4096);
     SizedBuf::Holder h_mani_buf(mani_buf);
     // Resizable serializer.
@@ -740,6 +773,44 @@ Status LogManifest::storeInternal(bool call_fsync) {
     }
     if (cursor) skiplist_release_node(cursor);
 
+    return writeManifest(mani_buf, ss, call_fsync);
+}
+
+Status LogManifest::storeEntries(const std::vector<Entry>& entries) {
+    if (mFileName.empty() || !fOps) return Status::NOT_INITIALIZED;
+    std::unique_lock<std::mutex> l(mFileWriteLock);
+
+    SizedBuf mani_buf(4096);
+    SizedBuf::Holder h_mani_buf(mani_buf);
+    RwSerializer ss(&mani_buf);
+
+    // Same format as `storeInternal`.
+    ss.putU64(maxLogFileNum);
+    ss.putU64(lastFlushedLog);
+    ss.putU64(lastSyncedLog);
+    ss.putU32(entries.size());
+    for (const Entry& ee: entries) {
+        ss.putU64(ee.fileNum);
+        ss.putU64(ee.minSeq);
+        ss.putU64(ee.flushedSeq);
+        ss.putU64(ee.syncedSeq);
+    }
+    _log_info(myLog,
+              "stored aligned manifest: max log file num %s, last flush %s, "
+              "last sync %s, num log files %zu",
+              _seq_str(maxLogFileNum).c_str(),
+              _seq_str(lastFlushedLog).c_str(),
+              _seq_str(lastSyncedLog).c_str(),
+              entries.size());
+
+    return writeManifest(mani_buf, ss, true);
+}
+
+Status LogManifest::writeManifest(SizedBuf& mani_buf,
+                                  RwSerializer& ss,
+                                  bool call_fsync)
+{
+    Status s;
     ss.put(LOGMANI_FOOTER, 8);
 
     // Version
