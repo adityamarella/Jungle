@@ -1225,6 +1225,19 @@ int patch_manifest_tail_min_seq(const std::string& path,
                               ManifestSeqField::MIN, min_seq);
 }
 
+// Steps (valid_minseq = false, log2 NIL/NIL):
+//   1. sync(true) through 450.
+//   2. setSN(451) rolls over to log2. addNewLogFile() stores the manifest
+//      before 451 is in log2, so log2 is NIL/NIL.
+//   3. sync(true) flushes and fsyncs log2 (451..455).
+//   4. Crash before that sync's manifest store.
+// valid_minseq = true (log2 451/NIL): between steps 2 and 3, another
+// manifest store runs after 451 is in log2's memtable, e.g. a concurrent
+// sync() that started before the rollover and covers only log1.
+// Needs: rollover (maxEntriesInLogFile / maxLogFileSize). 451/NIL also
+// needs sync() running concurrently with writes.
+// Realism: high. The incident started from this state (log 367286 451/NIL,
+// records 451..456 on disk).
 int inconsistent_manifest_recovery_test(bool valid_minseq) {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1490,6 +1503,16 @@ int verify_manifest_crash_recovery(const std::string& db_path,
 }
 
 // Crash after fsyncing the last log file but before its manifest update.
+// Steps:
+//   1. sync(true) through 453. Manifest has log1 451/453.
+//   2. setSN(454..456), no rollover.
+//   3. sync(true) flushes and fsyncs log1 through 456.
+//   4. Crash before that sync's manifest store.
+// Needs: nothing beyond defaults.
+// With skipManifestSync = true, step 3 skips the manifest store, so this is
+// the normal on-disk state until the next rollover or close.
+// Realism: high with skipManifestSync. Otherwise medium: the crash must hit
+// the window between the file fsync and the manifest write inside one sync().
 int manifest_crash_stale_synced_test() {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1521,6 +1544,19 @@ int manifest_crash_stale_synced_test() {
 
 // Rollover to log2 persists the manifest with log1's stale in-memory synced seq.
 // Crash after fsyncing log1 and log2 but before the manifest update.
+// Steps:
+//   1. sync(true) through 453. Manifest has log1 451/453.
+//   2. setSN(454..456) fills log1. setSN(457) rolls over to log2, and
+//      addNewLogFile() stores the manifest (no fsync) with log1 still at
+//      451/453 and log2 NIL/NIL.
+//   3. setSN(458..460).
+//   4. sync(true) flushes and fsyncs log1 (454..456) and log2 (457..460).
+//   5. Crash before that sync's manifest store.
+// Needs: rollover (maxEntriesInLogFile / maxLogFileSize) with no sync between
+// the last write to log1 and the rollover, and skipManifestSync = false (with
+// true, step 2 stores nothing and log2 is missing from the manifest).
+// Realism: high. Every rollover writes this manifest, and the crash window
+// is the whole first sync() after it, including the fsync of both files.
 int manifest_crash_stale_before_data_tail_test() {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1554,6 +1590,16 @@ int manifest_crash_stale_before_data_tail_test() {
 }
 
 // Same as above, but crash after fsyncing log1 and before flushing log2.
+// Steps:
+//   1-3. Same as above, up to the rollover to log2.
+//   4.   sync(true) flushes and fsyncs log1 (454..456).
+//   5.   Crash before it flushes log2, so log2 has only its header.
+// zero_length_last = true: log2's header never reached the disk either.
+// create() does not fsync the header, so this needs power loss; after a
+// process kill the header is already in the page cache.
+// Needs: same as above.
+// Realism: high. Same trigger as above; the crash lands earlier in the same
+// sync(). Zero-length: medium, power loss only.
 int manifest_crash_stale_before_empty_tail_test(bool zero_length_last) {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1596,6 +1642,18 @@ int manifest_crash_stale_before_empty_tail_test(bool zero_length_last) {
 }
 
 // Two rollovers between syncs leave two stale entries before the tail.
+// Steps:
+//   1. sync(true) through 453.
+//   2. setSN(454..463) with no sync. The rollover to log2 at 457 stores
+//      log1 451/453, log2 NIL/NIL. The rollover to log3 at 463 stores
+//      log1 451/453, log2 457/NIL (min from its memtable), log3 NIL/NIL.
+//   3. setSN(464..465).
+//   4. sync(true) flushes and fsyncs log1..log3.
+//   5. Crash before that sync's manifest store.
+// Needs: more than one log file's worth of writes between two syncs, e.g. a
+// large append batch or a sync() stalled on a slow fsync.
+// Realism: medium. Depends on file size vs. sync frequency; rarer with large
+// files (MonstorDB defaults: 32 MB, 256K entries).
 int manifest_crash_stale_across_rollovers_test() {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1630,6 +1688,19 @@ int manifest_crash_stale_across_rollovers_test() {
 
 // Overwriting without rollback appends a lower seq, so the last
 // record in the file is not the highest seq.
+// Steps (unsynced_log = false, log1 451/453):
+//   1. sync(true) through 453.
+//   2. setSN(454..456), then setSN(453) again without rollback.
+//   3. sync(true) appends 453', 454..456 to log1 and fsyncs it.
+//   4. Crash before that sync's manifest store.
+// unsynced_log = true (log1 NIL/NIL): the rollover to log1 stores NIL/NIL.
+// 451..456 and the overwrite of 453 are all flushed by one sync(true), so
+// the file has 451..456 with the new 453. Crash before its manifest store.
+// Needs: allowOverwriteSeqNum = true and a caller that overwrites without
+// rolling back first.
+// Realism: low for MonstorDB. write_at() calls rollback(index - 1) first,
+// which truncates the file. It skips the rollback only if getMaxSeqNum() is
+// below the index, as in the incident, where the stale manifest hid 451..456.
 int manifest_crash_overwrite_test(bool unsynced_log) {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1683,6 +1754,18 @@ int manifest_crash_overwrite_test(bool unsynced_log) {
 
 // Seq numbers may skip at rollover (e.g. a log compaction marker),
 // so log2's first seq does not prove where log1 ends.
+// Steps:
+//   1. sync(true) through 453.
+//   2. setSN(454..456) fills log1. setSN(470) skips 457..469 and rolls over
+//      to log2 (start seq 457). The rollover stores log1 451/453, log2 NIL/NIL.
+//   3. setSN(471..473). sync(true) flushes and fsyncs log1 and log2.
+//   4. Crash before that sync's manifest store.
+// Needs: rollover plus a caller that skips seqs. In MonstorDB, compact()
+// writes a dummy entry at last_log_index when the log is behind a snapshot,
+// then calls sync(true) and purges up to that index.
+// Realism: low. The skip must land on a file boundary, and compact() purges
+// log1 right after its sync. The test mainly checks that a gap is not
+// treated as corruption.
 int manifest_crash_seq_gap_test() {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
@@ -1756,6 +1839,21 @@ int manifest_crash_missing_synced_prefix_test() {
     return 0;
 }
 
+// A partial record after the last complete one in the last log file.
+// Steps (stale_manifest = true, log1 451/NIL):
+//   1. sync(true) through 450. setSN(451..456) rolls over to log1 at 451.
+//   2. A manifest store runs after 451 is in log1's memtable (see
+//      inconsistent manifest test).
+//   3. sync(true) is killed while flushing log1: 451..456 are written, and
+//      the bytes after them (e.g. the flush marker) are cut short. No
+//      manifest store follows.
+// stale_manifest = false (log1 451/456): 451..456 were synced and the
+// manifest was stored. A later flush into log1 (not yet full) is cut short.
+// Needs: a partial write. With direct I/O off, each record field is a
+// separate pwrite, so a process kill mid-flush can leave one. Power loss can
+// leave one in the unfsynced tail. With direct I/O on, writes go out in
+// aligned buffer chunks; whether a kill leaves a partial record is unverified.
+// Realism: medium. Power loss with an unfsynced tail: high.
 int manifest_crash_incomplete_tail_test(bool stale_manifest) {
     std::string filename;
     TEST_SUITE_PREPARE_PATH(filename);
