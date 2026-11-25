@@ -23,16 +23,15 @@ limitations under the License.
  * overlapping sequence numbers on subsequent writes. Scanning the log tail
  * reconciles those two sources before recovery accepts new writes.
  *
- * An intact, single-log (~24 MiB) fixture is opened with
- * truncateInconsecutiveLogs enabled (tail scan) and disabled (control).
- * Comparing DB::open latency and peak RSS shows the normal startup cost of
- * the more robust scan, not the cost of repairing a damaged log. Disabling
- * truncateInconsecutiveLogs also disables other recovery checks, so the
- * no-scan result is only a control for an intact fixture.
+ * An intact, single-log (~24 MiB) fixture is opened, and DB::open latency
+ * and peak RSS are reported. This is the normal startup cost of the scan,
+ * not the cost of repairing a damaged log. The scan always runs in
+ * log-section mode, so there is no no-scan control.
  *
  * One local run on 2026-09-24: with an Apple M1 Max
  * (10 CPU cores, 64 GiB RAM), macOS 26.4.1/arm64, Apple clang 17,
  * CMake Debug build; direct I/O requested with a 32 KiB buffer.
+ * The no-scan control was measured when the scan could still be disabled.
  *   records=3072 value_bytes=8192 log_bytes=25288704 (~24.1 MiB)
  *   scan=1 open_ms=94.646 peak_rss_bytes=65110016 (~62.1 MiB)
  *   scan=0 open_ms=0.794 peak_rss_bytes=11157504 (~10.6 MiB)
@@ -82,7 +81,7 @@ bool check_status(jungle::Status status, const char* operation) {
     return false;
 }
 
-jungle::DBConfig make_db_config(bool scan) {
+jungle::DBConfig make_db_config() {
     jungle::DBConfig config;
     config.logSectionOnly = true;
     config.logFileTtl_sec = 600;
@@ -91,7 +90,6 @@ jungle::DBConfig make_db_config(bool scan) {
     config.maxLogFileSize = 64 * 1024 * 1024;
     config.directIoOpt.enabled = true;
     config.directIoOpt.bufferSize = 32 * 1024;
-    config.truncateInconsecutiveLogs = scan;
     return config;
 }
 
@@ -141,7 +139,7 @@ bool make_default_fixture_path(fs::path& path) {
 
 bool create_fixture(const fs::path& path) {
     jungle::DB* db = nullptr;
-    if (!check_status(jungle::DB::open(&db, path.string(), make_db_config(true)),
+    if (!check_status(jungle::DB::open(&db, path.string(), make_db_config()),
                       "DB::open")) {
         return false;
     }
@@ -185,11 +183,11 @@ bool check_fixture(const fs::path& path, uintmax_t& log_bytes) {
     return true;
 }
 
-bool open_fixture(const fs::path& path, bool scan, OpenSample& sample) {
+bool open_fixture(const fs::path& path, OpenSample& sample) {
     jungle::DB* db = nullptr;
     const auto start = std::chrono::steady_clock::now();
     const jungle::Status status =
-        jungle::DB::open(&db, path.string(), make_db_config(scan));
+        jungle::DB::open(&db, path.string(), make_db_config());
     const auto end = std::chrono::steady_clock::now();
     if (!check_status(status, "DB::open")) return false;
     sample.elapsed_ms =
@@ -226,13 +224,12 @@ bool open_fixture(const fs::path& path, bool scan, OpenSample& sample) {
 }
 
 #if defined(__APPLE__) || defined(__linux__)
-enum class Phase { CREATE, SCAN, NO_SCAN };
+enum class Phase { CREATE, SCAN };
 
 const char* phase_name(Phase phase) {
     switch (phase) {
     case Phase::CREATE: return "create";
     case Phase::SCAN: return "scan";
-    case Phase::NO_SCAN: return "no-scan";
     }
     return "unknown";
 }
@@ -256,7 +253,7 @@ bool execute_phase(const fs::path& path, Phase phase) {
     OpenSample sample;
     const bool success = create
         ? create_fixture(path)
-        : open_fixture(path, phase == Phase::SCAN, sample);
+        : open_fixture(path, sample);
     const bool shut_down = check_status(jungle::shutdown(), "jungle::shutdown");
     if (!success || !shut_down) return false;
 
@@ -278,8 +275,7 @@ bool execute_phase(const fs::path& path, Phase phase) {
                   << " value_bytes=" << VALUE_BYTES
                   << " log_bytes=" << log_bytes << '\n';
     } else {
-        std::cout << "scan=" << (phase == Phase::SCAN)
-                  << " log_bytes=" << log_bytes << " open_ms="
+        std::cout << "scan=1 log_bytes=" << log_bytes << " open_ms="
                   << std::fixed << std::setprecision(3) << sample.elapsed_ms
                   << " peak_rss_bytes=";
         if (sample.rss_available) {
@@ -342,8 +338,7 @@ int main(int argc, char** argv) {
     fs::path path;
     if (!make_default_fixture_path(path)) return 1;
     const bool success = run_phase(path, Phase::CREATE) &&
-                         run_phase(path, Phase::SCAN) &&
-                         run_phase(path, Phase::NO_SCAN);
+                         run_phase(path, Phase::SCAN);
 
     std::error_code error;
     fs::remove_all(path.parent_path(), error);

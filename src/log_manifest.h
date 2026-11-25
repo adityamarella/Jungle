@@ -390,7 +390,8 @@ private:
      * @param[out] changed_out `true` if any entry has been updated.
      * @param[out] truncations_out Log files to be truncated.
      * @return `FILE_CORRUPTION` if the log files cannot be aligned
-     *         without losing synced data.
+     *         without losing synced data, and `truncateInconsecutiveLogs`
+     *         is not set. If set, the corrupted files are dropped instead.
      */
     Status reconcileWithLogFiles(std::vector<Entry>& entries,
                                  bool& changed_out,

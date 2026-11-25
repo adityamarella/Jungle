@@ -136,7 +136,7 @@ public:
         : allowOverwriteSeqNum(false)
         , logSectionOnly(false)
         , autoLogFlush(true)
-        , truncateInconsecutiveLogs(true)
+        , truncateInconsecutiveLogs(false)
         , logFileTtl_sec(0)
         , maxKeepingMemtables(0)
         , maxKeepingCheckpoints(10)
@@ -232,8 +232,15 @@ public:
 
     /*
      * (Only when `logSectionOnly == true`)
-     * Truncate tail logs if they are inconsecutive,
-     * to avoid empty log (a hole) in the middle.
+     * On open, the log manifest is aligned with the log files, and
+     * an incomplete entry at the end of the last log file is truncated.
+     * If the log files are corrupted beyond that (e.g., synced logs are
+     * missing, a log file is corrupted in the middle, or log files
+     * overlap), the open fails with `FILE_CORRUPTION` by default.
+     *
+     * If set, the corrupted log file and all following log files are
+     * dropped instead, to avoid an empty log (a hole) in the middle.
+     * Synced logs in those files are lost.
      */
     bool truncateInconsecutiveLogs;
 

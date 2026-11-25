@@ -248,18 +248,23 @@ Status LogManifest::create(const std::string& path,
 //   r = scan(e.file); if missing: stop
 //   torn     = parsing stopped on an error
 //   promised = e.synced >= e.min                // entry claims records
-//   if torn and valid(next_min): FILE_CORRUPTION
+//   if torn and valid(next_min): CORRUPTED(e)
 //   if synced seq would be lowered:
-//       torn ? warn and accept : FILE_CORRUPTION
+//       torn ? warn and accept : CORRUPTED(e)
 //   if no records:
 //       at the end of the log (not first entry): remove e
 //       else if torn: truncate to last intact entry later
 //       continue
-//   if r.last >= next_min: FILE_CORRUPTION      // overlap; gaps are fine
+//   if r.last >= next_min: CORRUPTED(next file) // overlap; gaps are fine
 //   if torn or e != (r.min, r.last):
 //       fsync; truncate to last intact entry later if torn
 //       e = (r.min, r.last)
 //   next_min = e.min
+//
+// CORRUPTED(f):
+//   if !truncateInconsecutiveLogs: FILE_CORRUPTION
+//   else drop f and all later files, losing their records (max/synced
+//   log = f - 1), and continue with the previous file as the last one.
 //
 // Removing empty tail files lowers max/synced/flushed log numbers to
 // the new last file.
@@ -273,12 +278,38 @@ Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
 {
     changed_out = false;
     truncations_out.clear();
-    const uint64_t last_synced_log = lastSyncedLog.load();
+    uint64_t last_synced_log = lastSyncedLog.load();
+    const bool drop_corrupted_tail =
+        logMgr->getDbConfig()->truncateInconsecutiveLogs;
 
     // Min seq of the closest later file that has records.
     uint64_t next_min_seq = NOT_INITIALIZED;
     // Number of empty files at the end, to be removed.
     size_t num_empty_tail = 0;
+
+    // Drop `entries[idx]` and all later entries, same as the old
+    // `truncateInconsecutiveLogs` behavior.
+    auto drop_tail = [&](size_t idx) {
+        const uint64_t file_num = entries[idx].fileNum;
+        _log_err(myLog, "dropping corrupted log files %zu - %zu, "
+                 "their records will be lost",
+                 file_num, entries.back().fileNum);
+        entries.resize(idx);
+        truncations_out.erase(
+            std::remove_if(truncations_out.begin(), truncations_out.end(),
+                           [&](const Truncation& tt) {
+                               return tt.fileNum >= file_num;
+                           }),
+            truncations_out.end());
+        if (file_num) {
+            maxLogFileNum = file_num - 1;
+            lastSyncedLog = file_num - 1;
+            last_synced_log = file_num - 1;
+        }
+        next_min_seq = NOT_INITIALIZED;
+        num_empty_tail = 0;
+        changed_out = true;
+    };
 
     for (size_t ii = entries.size(); ii-- > 0; ) {
         Entry& ee = entries[ii];
@@ -345,7 +376,9 @@ Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
         if (torn && valid_number(next_min_seq)) {
             _log_err(myLog, "log file %s is corrupted before the end of log",
                      l_filename.c_str());
-            return Status::FILE_CORRUPTION;
+            if (!drop_corrupted_tail) return Status::FILE_CORRUPTION;
+            drop_tail(ii);
+            continue;
         }
 
         // Synced seq should never be lowered. A torn end is left by
@@ -366,7 +399,9 @@ Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
                          _seq_str(ee.syncedSeq).c_str(),
                          _seq_str(res.minSeq).c_str(),
                          _seq_str(res.lastSeq).c_str());
-                return Status::FILE_CORRUPTION;
+                if (!drop_corrupted_tail) return Status::FILE_CORRUPTION;
+                drop_tail(ii);
+                continue;
             }
             _log_warn(myLog, "torn log file %s lost synced seq: manifest "
                       "%s - %s, actual %s - %s",
@@ -400,7 +435,10 @@ Status LogManifest::reconcileWithLogFiles(std::vector<Entry>& entries,
                      _seq_str(res.lastSeq).c_str(),
                      l_filename.c_str(),
                      _seq_str(next_min_seq).c_str());
-            return Status::FILE_CORRUPTION;
+            if (!drop_corrupted_tail) return Status::FILE_CORRUPTION;
+            // The next file does not follow this one: keep this one
+            // as the last file.
+            drop_tail(ii + 1);
         }
 
         const bool updated = res.minSeq != ee.minSeq ||
@@ -517,8 +555,7 @@ Status LogManifest::load(const std::string& path,
     // Align entries with the log files before loading them. On failure,
     // `LogMgr::init` should not retry with the backup manifest.
     bool entries_changed = false;
-    if ( db_config->logSectionOnly &&
-         db_config->truncateInconsecutiveLogs ) {
+    if (db_config->logSectionOnly) {
         std::vector<Truncation> truncations;
         s = reconcileWithLogFiles(entries, entries_changed, truncations);
         if (!s) {

@@ -2036,6 +2036,208 @@ int manifest_crash_during_recovery_truncation_test() {
     return 0;
 }
 
+// Log files that cannot be aligned with the manifest without losing synced
+// records. By default, the open fails and leaves the files as they are.
+// With `truncateInconsecutiveLogs`, the corrupted file and all later files
+// are dropped, and the rest is recovered.
+int verify_corrupted_log_recovery(const std::string& db_path,
+                                  bool drop_corrupted,
+                                  size_t num_log_files,
+                                  size_t num_kept_files,
+                                  const std::vector<SeqRange>& kept_seqs,
+                                  uint64_t kept_max,
+                                  const std::vector<ManifestEntry>& kept_manifest) {
+    jungle::DBConfig config = manifest_crash_config();
+    config.directIoOpt.enabled = false;
+    if (!drop_corrupted) {
+        jungle::DB* db = nullptr;
+        jungle::Status s = jungle::DB::open(&db, db_path, config);
+        CHK_EQ(jungle::Status::FILE_CORRUPTION, s.getValue());
+        for (size_t ii = 0; ii < num_log_files; ++ii) {
+            CHK_TRUE(TestSuite::exist(log_file_path(db_path, ii)));
+        }
+        return 0;
+    }
+
+    config.truncateInconsecutiveLogs = true;
+    {
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, db_path, config));
+        for (size_t ii = num_kept_files; ii < num_log_files; ++ii) {
+            CHK_FALSE(TestSuite::exist(log_file_path(db_path, ii)));
+        }
+    }
+    CHK_Z(verify_manifest_crash_recovery(db_path, config, num_kept_files,
+                                         kept_seqs, kept_max, kept_manifest));
+    return 0;
+}
+
+// The last log file lost synced records, but ends cleanly.
+// Manifest: log1 451/456. Physical log: log1 451..453.
+int corrupted_log_lost_synced_test(bool drop_corrupted) {
+    std::string filename;
+    TEST_SUITE_PREPARE_PATH(filename);
+    CHK_Z(init_manifest_crash_test());
+    jungle::DBConfig config = manifest_crash_config();
+    config.directIoOpt.enabled = false;
+
+    const std::string log1 = log_file_path(filename, 1);
+    const std::string short_log = filename + "/log_through_453";
+    {
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, filename, config));
+        CHK_Z(write_log_seq_range(db, 445, 450));
+        CHK_Z(db->sync(true));
+        CHK_Z(write_log_seq_range(db, 451, 453));
+        CHK_Z(db->sync(true));
+        CHK_Z(TestSuite::copyfile(log1, short_log));
+        CHK_Z(write_log_seq_range(db, 454, 456));
+        CHK_Z(db->sync(true));
+    }
+    CHK_Z(TestSuite::copyfile(short_log, log1));
+
+    CHK_Z(verify_corrupted_log_recovery(filename, drop_corrupted, 2, 1,
+                                        {{445, 450}}, 450, {{445, 450}}));
+    CHK_Z(jungle::shutdown());
+    TEST_SUITE_CLEANUP_PATH();
+    return 0;
+}
+
+// A log file is torn before the end of the log.
+// Manifest: log1 451/453, log2 NIL/NIL (stored at the rollover).
+// Physical log: log1 451..453 and a partial 454, log2 457..460.
+int corrupted_log_torn_before_end_test(bool drop_corrupted) {
+    std::string filename;
+    TEST_SUITE_PREPARE_PATH(filename);
+    CHK_Z(init_manifest_crash_test());
+    jungle::DBConfig config = manifest_crash_config();
+    config.directIoOpt.enabled = false;
+
+    const std::string log1 = log_file_path(filename, 1);
+    const std::string snapshot = filename + "/crash_manifest";
+    std::vector<char> log1_upto_453;
+    {
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, filename, config));
+        CHK_Z(write_log_seq_range(db, 445, 450));
+        CHK_Z(db->sync(true));
+        CHK_Z(write_log_seq_range(db, 451, 453));
+        CHK_Z(db->sync(true));
+        CHK_Z(read_file(log1, log1_upto_453));
+        CHK_Z(write_log_seq_range(db, 454, 457));
+        CHK_Z(TestSuite::copyfile(filename + "/log0000_manifest", snapshot));
+        CHK_Z(write_log_seq_range(db, 458, 460));
+        CHK_Z(db->sync(true));
+    }
+    CHK_Z(restore_crash_manifest(filename, snapshot));
+    std::vector<char> log1_data;
+    CHK_Z(read_file(log1, log1_data));
+    const size_t torn_size = log1_upto_453.size() + 5;
+    CHK_GT(log1_data.size(), torn_size);
+    CHK_Z(write_file(log1, log1_data.data(), torn_size));
+
+    CHK_Z(verify_corrupted_log_recovery(filename, drop_corrupted, 3, 1,
+                                        {{445, 450}}, 450, {{445, 450}}));
+    CHK_Z(jungle::shutdown());
+    TEST_SUITE_CLEANUP_PATH();
+    return 0;
+}
+
+// The next log file starts before the end of the previous one.
+// Manifest: log1 451/456, log2 457/460.
+// Physical log: log1 451..456, log2 455..460 (copied from another DB).
+// The next file does not follow, so it is the one dropped.
+int corrupted_log_overlap_test(bool drop_corrupted) {
+    std::string filename;
+    TEST_SUITE_PREPARE_PATH(filename);
+    CHK_Z(init_manifest_crash_test());
+    jungle::DBConfig config = manifest_crash_config();
+    config.directIoOpt.enabled = false;
+
+    const std::string other = filename + "_other";
+    {
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, other, config));
+        CHK_Z(write_log_seq_range(db, 443, 460));
+        CHK_Z(db->sync(true));
+    }
+    {
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, filename, config));
+        CHK_Z(write_log_seq_range(db, 445, 460));
+        CHK_Z(db->sync(true));
+    }
+    CHK_Z(check_manifest_entries(filename + "/log0000_manifest",
+                                 {{445, 450}, {451, 456}, {457, 460}}));
+    CHK_Z(check_manifest_entries(other + "/log0000_manifest",
+                                 {{443, 448}, {449, 454}, {455, 460}}));
+    CHK_Z(TestSuite::copyfile(log_file_path(other, 2),
+                              log_file_path(filename, 2)));
+
+    CHK_Z(verify_corrupted_log_recovery(filename, drop_corrupted, 3, 2,
+                                        {{445, 456}}, 456,
+                                        {{445, 450}, {451, 456}}));
+    CHK_Z(jungle::shutdown());
+    TEST_SUITE_CLEANUP_PATH();
+    return 0;
+}
+
+// The only log file lost synced records: every log file is dropped,
+// and recovery starts from an empty log, same as the old behavior.
+// Manifest: log0 445/450. Physical log: log0 445..448.
+int corrupted_log_drop_all_test(bool drop_corrupted) {
+    std::string filename;
+    TEST_SUITE_PREPARE_PATH(filename);
+    CHK_Z(init_manifest_crash_test());
+    jungle::DBConfig config = manifest_crash_config();
+    config.directIoOpt.enabled = false;
+
+    const std::string log0 = log_file_path(filename, 0);
+    const std::string short_log = filename + "/log_through_448";
+    {
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, filename, config));
+        CHK_Z(write_log_seq_range(db, 445, 448));
+        CHK_Z(db->sync(true));
+        CHK_Z(TestSuite::copyfile(log0, short_log));
+        CHK_Z(write_log_seq_range(db, 449, 450));
+        CHK_Z(db->sync(true));
+    }
+    CHK_Z(TestSuite::copyfile(short_log, log0));
+
+    if (!drop_corrupted) {
+        CHK_Z(verify_corrupted_log_recovery(filename, false, 1, 0, {}, 0, {}));
+    } else {
+        config.truncateInconsecutiveLogs = true;
+        jungle::DB* db = nullptr;
+        DBCloser closer{db};
+        CHK_Z(jungle::DB::open(&db, filename, config));
+        // Empty log.
+        uint64_t max_seq = 0;
+        CHK_EQ(jungle::Status::LOG_NOT_EXIST,
+               db->getMaxSeqNum(max_seq).getValue());
+        jungle::KV kv_out;
+        jungle::KV::Holder h(kv_out);
+        CHK_FALSE(db->getSN(445, kv_out));
+
+        CHK_Z(write_log_seq_range(db, 1, 3));
+        CHK_Z(db->sync(true));
+        CHK_Z(jungle::DB::close(db));
+        db = nullptr;
+        CHK_Z(jungle::DB::open(&db, filename, config));
+        CHK_Z(check_seq_ranges(db, {{1, 3}}));
+    }
+    CHK_Z(jungle::shutdown());
+    TEST_SUITE_CLEANUP_PATH();
+    return 0;
+}
+
 
 int void_log_file_at_the_end_test(bool emulate_crash) {
     std::string filename;
@@ -3038,6 +3240,19 @@ int main(int argc, char** argv) {
 
     ts.doTest("manifest crash during recovery truncation test",
               manifest_crash_during_recovery_truncation_test);
+
+    ts.doTest("corrupted log lost synced test",
+              corrupted_log_lost_synced_test,
+              TestRange<bool>( {false, true} ));
+    ts.doTest("corrupted log torn before end test",
+              corrupted_log_torn_before_end_test,
+              TestRange<bool>( {false, true} ));
+    ts.doTest("corrupted log overlap test",
+              corrupted_log_overlap_test,
+              TestRange<bool>( {false, true} ));
+    ts.doTest("corrupted log drop all test",
+              corrupted_log_drop_all_test,
+              TestRange<bool>( {false, true} ));
 
     // TODO: expected behavior to be decided together with rollback crash handling.
 #if 0
